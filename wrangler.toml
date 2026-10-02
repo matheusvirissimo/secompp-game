@@ -1,0 +1,16 @@
+name = "secompp-game"
+main = "src/server/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[dev]
+port = 8787
+
+[durable_objects]
+bindings = [
+  { name = "MATCH_ROOM", class_name = "MatchRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["MatchRoom"]
