@@ -31,16 +31,16 @@ interface PlayerData {
 
 interface Env {
   MATCH_ROOM: DurableObjectNamespace;
+  DB: D1Database;
 }
 
-// ==================== MatchRoom Durable Object ====================
-
-export class MatchRoom extends DurableObject {
+export class MatchRoom extends DurableObject<Env> {
   // Match state
   private phase: MatchPhase = "WAITING";
   private matchId = "";
   private players = new Map<string, PlayerData>();
   private playerOrder: string[] = []; 
+  private matchStartedAt: string | null = null;
 
   // Turn state
   private currentTurn = 0;
@@ -50,11 +50,12 @@ export class MatchRoom extends DurableObject {
   private actions = new Map<string, AttackAction | DefenderAction>();
   private consecutiveInactiveTurns = 0;
   private resolvedTurn = 0; 
+  private turnHistory: any[] = []; // Store turns for D1
 
   // Reconnection state
   private pausedPhase: MatchPhase | null = null;
   private pausedTurnRemainingMs: number | null = null;
-  private disconnectTimeoutId: string | null = null; // To track who disconnected if needed, but we can just check sockets
+  private disconnectTimeoutId: string | null = null;
 
   // Match result
   private winnerId: string | null = null;
@@ -301,6 +302,7 @@ export class MatchRoom extends DurableObject {
   }
 
   private startMatch(): void {
+    this.matchStartedAt = new Date().toISOString();
     const firstAttackerIdx = flipCoin() === "HEADS" ? 0 : 1;
     this.attackerId = this.playerOrder[firstAttackerIdx];
     this.defenderId = this.playerOrder[1 - firstAttackerIdx];
@@ -449,6 +451,16 @@ export class MatchRoom extends DurableObject {
       defenderId: this.defenderId!,
     });
 
+    this.turnHistory.push({
+      turn_number: this.currentTurn,
+      attacker_id: this.attackerId!,
+      defender_id: this.defenderId!,
+      attack_direction: attackerAction?.direction ?? null,
+      defense_type: defenderAction?.type ?? null,
+      defense_direction: defenderAction?.direction ?? null,
+      result: result.outcome,
+    });
+
     const victory = checkVictory(attacker.hp, defender.hp);
 
     if (victory.gameOver) {
@@ -501,6 +513,121 @@ export class MatchRoom extends DurableObject {
       loserId,
       finalHp,
     });
+
+    this.ctx.waitUntil(this.persistMatch(winnerId, loserId, finalHp));
+  }
+
+  private async persistMatch(winnerId: string | null, loserId: string | null, finalHp: Record<string, number>) {
+    try {
+      const db = this.env.DB;
+      const p1 = this.players.get(this.playerOrder[0])!;
+      const p2 = this.players.get(this.playerOrder[1])!;
+
+      // 1. Upsert players
+      await db.prepare(`
+        INSERT INTO players (id, display_name, session_token, last_seen_at) 
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(id) DO UPDATE SET 
+          display_name = excluded.display_name,
+          session_token = excluded.session_token,
+          last_seen_at = excluded.last_seen_at
+      `).bind(p1.playerId, p1.displayName, p1.sessionToken).run();
+
+      await db.prepare(`
+        INSERT INTO players (id, display_name, session_token, last_seen_at) 
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(id) DO UPDATE SET 
+          display_name = excluded.display_name,
+          session_token = excluded.session_token,
+          last_seen_at = excluded.last_seen_at
+      `).bind(p2.playerId, p2.displayName, p2.sessionToken).run();
+
+      // 2. Insert match
+      await db.prepare(`
+        INSERT INTO matches (id, player_a_id, player_b_id, winner_id, loser_id, player_a_hp_final, player_b_hp_final, total_turns, started_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        this.matchId,
+        p1.playerId,
+        p2.playerId,
+        winnerId,
+        loserId,
+        finalHp[p1.playerId],
+        finalHp[p2.playerId],
+        this.currentTurn,
+        this.matchStartedAt || new Date().toISOString()
+      ).run();
+
+      // 3. Insert turns
+      if (this.turnHistory.length > 0) {
+        // Prepare bulk insert (D1 max batch size logic could be needed, but a game usually has < 20 turns)
+        const stmt = db.prepare(`
+          INSERT INTO turns (id, match_id, turn_number, attacker_id, defender_id, attack_direction, defense_type, defense_direction, result)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        const batch = this.turnHistory.map(t => stmt.bind(
+          crypto.randomUUID(),
+          this.matchId,
+          t.turn_number,
+          t.attacker_id,
+          t.defender_id,
+          t.attack_direction,
+          t.defense_type,
+          t.defense_direction,
+          t.result
+        ));
+        await db.batch(batch);
+      }
+
+      // 4. Update leaderboard
+      // Could be complex, let's do simple updates
+      await this.updateLeaderboard(p1.playerId, p1.displayName, winnerId === p1.playerId, winnerId === p2.playerId);
+      await this.updateLeaderboard(p2.playerId, p2.displayName, winnerId === p2.playerId, winnerId === p1.playerId);
+
+    } catch (e) {
+      console.error("Failed to persist match to D1:", e);
+    }
+  }
+
+  private async updateLeaderboard(playerId: string, displayName: string, isWinner: boolean, isLoser: boolean) {
+    const db = this.env.DB;
+    const entry = await db.prepare(`SELECT current_streak, best_streak, points FROM leaderboard WHERE player_id = ?`).bind(playerId).first<{ current_streak: number, best_streak: number, points: number }>();
+    
+    let currentStreak = entry ? entry.current_streak : 0;
+    let bestStreak = entry ? entry.best_streak : 0;
+    let points = entry ? entry.points : 0;
+
+    let winsIncrement = 0;
+    let lossesIncrement = 0;
+
+    if (isWinner) {
+      winsIncrement = 1;
+      currentStreak += 1;
+      if (currentStreak > bestStreak) bestStreak = currentStreak;
+      // Formula: BASE_WIN_POINTS (3) + STREAK_BONUS (1 * streak)
+      points += GAME_CONFIG.LEADERBOARD.BASE_WIN_POINTS + (currentStreak * GAME_CONFIG.LEADERBOARD.STREAK_BONUS);
+    } else if (isLoser) {
+      lossesIncrement = 1;
+      currentStreak = 0;
+      points += GAME_CONFIG.LEADERBOARD.LOSS_POINTS;
+    } else {
+      // Draw or aborted
+      currentStreak = 0;
+    }
+
+    await db.prepare(`
+      INSERT INTO leaderboard (player_id, display_name, wins, losses, total_matches, current_streak, best_streak, points)
+      VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+      ON CONFLICT(player_id) DO UPDATE SET
+        display_name = excluded.display_name,
+        wins = leaderboard.wins + excluded.wins,
+        losses = leaderboard.losses + excluded.losses,
+        total_matches = leaderboard.total_matches + 1,
+        current_streak = excluded.current_streak,
+        best_streak = excluded.best_streak,
+        points = excluded.points,
+        updated_at = datetime('now')
+    `).bind(playerId, displayName, winsIncrement, lossesIncrement, currentStreak, bestStreak, points).run();
   }
 
   // ==================== Helpers ====================

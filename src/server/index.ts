@@ -4,11 +4,14 @@
  */
 
 import { MatchRoom } from "../durable-objects/MatchRoom";
+import { MatchmakingQueue } from "../durable-objects/MatchmakingQueue";
 
-export { MatchRoom };
+export { MatchRoom, MatchmakingQueue };
 
 interface Env {
   MATCH_ROOM: DurableObjectNamespace;
+  MATCHMAKING_QUEUE: DurableObjectNamespace;
+  DB: D1Database;
 }
 
 // ==================== CORS ====================
@@ -75,6 +78,13 @@ export default {
         return stub.fetch(request);
       }
 
+      // ---- WebSocket: matchmaking queue ----
+      if (url.pathname === "/ws/matchmaking") {
+        const doId = env.MATCHMAKING_QUEUE.idFromName("global-queue");
+        const stub = env.MATCHMAKING_QUEUE.get(doId);
+        return stub.fetch(request);
+      }
+
       // ---- HTTP: create match ----
       if (
         url.pathname === "/api/match/create" &&
@@ -105,6 +115,20 @@ export default {
         stateUrl.pathname = "/state";
 
         return corsResponse(await stub.fetch(stateUrl.toString()));
+      }
+
+      // ---- HTTP: leaderboard ----
+      if (url.pathname === "/api/leaderboard" && request.method === "GET") {
+        const result = await env.DB.prepare(`
+          SELECT player_id, display_name, wins, losses, total_matches, current_streak, best_streak, points 
+          FROM leaderboard 
+          ORDER BY points DESC, wins DESC 
+          LIMIT 10
+        `).all();
+        
+        return corsResponse(
+          Response.json({ leaderboard: result.results }, { status: 200 })
+        );
       }
 
       // ---- HTTP: health check ----

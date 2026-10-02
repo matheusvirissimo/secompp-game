@@ -450,8 +450,8 @@ describe("calculateLeaderboardPoints", () => {
 
 describe("full match simulation", () => {
   it("simulates a complete match ending in attacker victory", () => {
-    let attackerHp = GAME_CONFIG.INITIAL_HP; // 3
-    let defenderHp = GAME_CONFIG.INITIAL_HP; // 3
+    let attackerHp: number = GAME_CONFIG.INITIAL_HP;
+    let defenderHp: number = GAME_CONFIG.INITIAL_HP;
 
     // Turn 1: Attack UP, Dodge UP → DODGE_FAIL, defender -1 HP
     let result = resolveTurn(attack("UP"), dodge("UP"));
@@ -481,8 +481,8 @@ describe("full match simulation", () => {
   });
 
   it("simulates a match where counter wins for defender", () => {
-    let attackerHp = GAME_CONFIG.INITIAL_HP; // 3
-    let defenderHp = GAME_CONFIG.INITIAL_HP; // 3
+    let attackerHp: number = GAME_CONFIG.INITIAL_HP;
+    let defenderHp: number = GAME_CONFIG.INITIAL_HP;
 
     // Turn 1: Attack UP, Counter UP → COUNTER_SUCCESS, attacker -2 HP
     let result = resolveTurn(attack("UP"), counter("UP"));
@@ -505,8 +505,8 @@ describe("full match simulation", () => {
   });
 
   it("simulates a match with mixed actions and timeouts", () => {
-    let attackerHp = GAME_CONFIG.INITIAL_HP; // 3
-    let defenderHp = GAME_CONFIG.INITIAL_HP; // 3
+    let attackerHp: number = GAME_CONFIG.INITIAL_HP;
+    let defenderHp: number = GAME_CONFIG.INITIAL_HP;
 
     // Turn 1: Attacker timeout → no damage
     let result = resolveTimeout(false, true, null, dodge("UP"));

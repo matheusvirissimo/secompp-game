@@ -8,9 +8,15 @@ port = 8787
 
 [durable_objects]
 bindings = [
-  { name = "MATCH_ROOM", class_name = "MatchRoom" }
+  { name = "MATCH_ROOM", class_name = "MatchRoom" },
+  { name = "MATCHMAKING_QUEUE", class_name = "MatchmakingQueue" }
 ]
 
 [[migrations]]
-tag = "v1"
-new_classes = ["MatchRoom"]
+tag = "v2"
+new_classes = ["MatchmakingQueue"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "secompp-db"
+database_id = "secompp-db-id"

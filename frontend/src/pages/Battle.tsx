@@ -52,11 +52,26 @@ export function Battle() {
   }
 
   if (state.phase === "WAITING") {
+    const shareLink = `${window.location.origin}/join/${matchId}`;
     return (
       <div className="page">
         <div className="waiting-spinner" />
         <p className="status-text">Aguardando adversário...</p>
         <div className="match-code">{matchId}</div>
+        
+        <p className="status-text" style={{fontSize: '0.9rem', marginTop: '1rem'}}>
+          Link da sala:
+        </p>
+        <div 
+          className="match-code" 
+          style={{fontSize: '1rem', cursor: 'pointer', padding: '0.5rem'}}
+          onClick={() => navigator.clipboard.writeText(shareLink)}
+        >
+          {shareLink}
+          <div style={{fontSize: '0.8rem', marginTop: '0.5rem', color: 'var(--primary)'}}>
+            (Clique para copiar)
+          </div>
+        </div>
       </div>
     );
   }
