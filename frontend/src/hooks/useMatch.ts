@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ServerMessage, ClientMessage } from "../../src/shared/protocol";
-import type { Direction, MatchPhase, TurnOutcome } from "../../src/game/types";
+import type { ServerMessage, ClientMessage } from "@shared/protocol";
+import type { Direction, MatchPhase, TurnOutcome } from "@game/types";
 import { buildWebSocketUrl } from "../services/api";
 
 // ==================== Types ====================
@@ -58,17 +58,18 @@ const initialState: MatchState = {
 export function useMatch(
   matchId: string,
   playerId: string,
-  displayName: string
+  displayName: string,
+  sessionToken: string
 ) {
   const [state, setState] = useState<MatchState>({ ...initialState, matchId });
   const wsRef = useRef<WebSocket | null>(null);
-  const pingIntervalRef = useRef<ReturnType<typeof setInterval>>();
+  const pingIntervalRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
 
   // Connect WebSocket
   useEffect(() => {
-    if (!matchId || !playerId || !displayName) return;
+    if (!matchId || !playerId || !displayName || !sessionToken) return;
 
-    const url = buildWebSocketUrl(matchId, playerId, displayName);
+    const url = buildWebSocketUrl(matchId, playerId, displayName, sessionToken);
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
@@ -231,7 +232,15 @@ export function useMatch(
       case "OPPONENT_DISCONNECTED":
         setState((s) => ({
           ...s,
+          phase: "WAITING_RECONNECT",
           error: "Adversário desconectou...",
+        }));
+        break;
+
+      case "OPPONENT_RECONNECTED":
+        setState((s) => ({
+          ...s,
+          error: null,
         }));
         break;
 

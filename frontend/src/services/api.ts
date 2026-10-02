@@ -15,7 +15,8 @@ export async function createMatch(): Promise<{ matchId: string }> {
 export function buildWebSocketUrl(
   matchId: string,
   playerId: string,
-  displayName: string
+  displayName: string,
+  sessionToken: string
 ): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const host = window.location.host;
@@ -23,6 +24,7 @@ export function buildWebSocketUrl(
     playerId,
     displayName,
     matchId,
+    sessionToken,
   });
   return `${proto}//${host}/ws/match/${matchId}?${params}`;
 }

@@ -1,4 +1,4 @@
-import type { Direction } from "../../../src/game/types";
+import type { Direction } from "@game/types";
 
 interface DirectionPadProps {
   onSelect: (direction: Direction) => void;

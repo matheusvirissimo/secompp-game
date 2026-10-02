@@ -25,6 +25,7 @@ import type {
 interface PlayerData {
   playerId: string;
   displayName: string;
+  sessionToken: string;
   hp: number;
 }
 
@@ -34,23 +35,12 @@ interface Env {
 
 // ==================== MatchRoom Durable Object ====================
 
-/**
- * Each MatchRoom instance represents a single match.
- * 1 match = 1 Durable Object = single authoritative source of truth.
- *
- * Manages:
- * - WebSocket connections for both players
- * - Match state machine (WAITING → READY → PLAYING → RESOLVING → FINISHED)
- * - Turn timer via alarms
- * - Action validation and resolution using the Game Engine
- * - Turn alternation and role assignment
- */
 export class MatchRoom extends DurableObject {
   // Match state
   private phase: MatchPhase = "WAITING";
   private matchId = "";
   private players = new Map<string, PlayerData>();
-  private playerOrder: string[] = []; // [first joined, second joined]
+  private playerOrder: string[] = []; 
 
   // Turn state
   private currentTurn = 0;
@@ -59,7 +49,12 @@ export class MatchRoom extends DurableObject {
   private turnDeadline: number | null = null;
   private actions = new Map<string, AttackAction | DefenderAction>();
   private consecutiveInactiveTurns = 0;
-  private resolvedTurn = 0; // Guards against double resolution
+  private resolvedTurn = 0; 
+
+  // Reconnection state
+  private pausedPhase: MatchPhase | null = null;
+  private pausedTurnRemainingMs: number | null = null;
+  private disconnectTimeoutId: string | null = null; // To track who disconnected if needed, but we can just check sockets
 
   // Match result
   private winnerId: string | null = null;
@@ -89,12 +84,12 @@ export class MatchRoom extends DurableObject {
   private handleWebSocketUpgrade(url: URL): Response {
     const playerId = url.searchParams.get("playerId");
     const displayName = url.searchParams.get("displayName");
+    const sessionToken = url.searchParams.get("sessionToken");
 
-    if (!playerId || !displayName) {
-      return new Response("Missing playerId or displayName", { status: 400 });
+    if (!playerId || !displayName || !sessionToken) {
+      return new Response("Missing playerId, displayName or sessionToken", { status: 400 });
     }
 
-    // Validate match state
     if (this.phase === "FINISHED") {
       return new Response("Match is finished", { status: 410 });
     }
@@ -103,33 +98,43 @@ export class MatchRoom extends DurableObject {
       return new Response("Match is full", { status: 409 });
     }
 
-    // Create WebSocket pair
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    // Accept with player ID tag for identification
-    this.ctx.acceptWebSocket(server, [playerId]);
-
-    // Register player if new
-    if (!this.players.has(playerId)) {
+    if (this.players.has(playerId)) {
+      // Reconnection or multiple tabs
+      const existingPlayer = this.players.get(playerId)!;
+      if (existingPlayer.sessionToken !== sessionToken) {
+        return new Response("Invalid session token", { status: 403 });
+      }
+      
+      this.ctx.acceptWebSocket(server, [playerId]);
+      this.log("PLAYER_RECONNECTED", { playerId });
+      
+      // Send current state
+      this.sendToWs(server, this.buildMatchState(playerId));
+      
+      this.checkReconnection();
+    } else {
+      // New player
+      this.ctx.acceptWebSocket(server, [playerId]);
+      
       this.players.set(playerId, {
         playerId,
         displayName: this.sanitizeDisplayName(displayName),
+        sessionToken,
         hp: GAME_CONFIG.INITIAL_HP,
       });
       this.playerOrder.push(playerId);
       this.log("PLAYER_CONNECTED", { playerId, displayName });
-    }
 
-    this.matchId =
-      url.searchParams.get("matchId") || this.ctx.id.toString();
+      this.matchId = url.searchParams.get("matchId") || this.ctx.id.toString();
 
-    // Send initial state to the connecting player
-    this.sendToPlayer(playerId, this.buildMatchState(playerId));
+      this.sendToWs(server, this.buildMatchState(playerId));
 
-    // If both players are connected and we're still WAITING, transition
-    if (this.players.size === 2 && this.phase === "WAITING") {
-      this.transitionToReady();
+      if (this.players.size === 2 && this.phase === "WAITING") {
+        this.transitionToReady();
+      }
     }
 
     return new Response(null, { status: 101, webSocket: client });
@@ -137,10 +142,7 @@ export class MatchRoom extends DurableObject {
 
   // ==================== WebSocket Handlers ====================
 
-  async webSocketMessage(
-    ws: WebSocket,
-    message: string | ArrayBuffer
-  ): Promise<void> {
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== "string") return;
 
     const tags = this.ctx.getTags(ws);
@@ -151,11 +153,7 @@ export class MatchRoom extends DurableObject {
     try {
       parsed = JSON.parse(message);
     } catch {
-      this.sendToWs(ws, {
-        type: "ERROR",
-        message: "Invalid JSON",
-        code: "INVALID_JSON",
-      });
+      this.sendToWs(ws, { type: "ERROR", message: "Invalid JSON", code: "INVALID_JSON" });
       return;
     }
 
@@ -163,41 +161,28 @@ export class MatchRoom extends DurableObject {
       case "PING":
         this.sendToWs(ws, { type: "PONG" });
         break;
-
       case "ACTION":
         this.handleAction(playerId, parsed);
         break;
-
       default:
-        this.sendToWs(ws, {
-          type: "ERROR",
-          message: `Unknown message type: ${(parsed as any).type}`,
-          code: "UNKNOWN_TYPE",
-        });
+        this.sendToWs(ws, { type: "ERROR", message: `Unknown message type`, code: "UNKNOWN_TYPE" });
     }
   }
 
-  async webSocketClose(
-    ws: WebSocket,
-    code: number,
-    _reason: string,
-    _wasClean: boolean
-  ): Promise<void> {
+  async webSocketClose(ws: WebSocket, code: number, _reason: string, _wasClean: boolean): Promise<void> {
     const tags = this.ctx.getTags(ws);
     const playerId = tags[0];
     if (!playerId) return;
 
     this.log("PLAYER_DISCONNECTED", { playerId, code });
 
-    // Phase 3: if a player disconnects during a match, opponent wins by forfeit
-    // Phase 4 will add proper reconnection support
+    // Check if player has any other active sockets (e.g., multiple tabs)
+    const activeSockets = this.ctx.getWebSockets(playerId);
+    if (activeSockets.length > 0) return; // Still connected elsewhere
+
     if (this.phase === "PLAYING" || this.phase === "RESOLVING") {
-      const opponentId = this.getOpponentId(playerId);
-      if (opponentId) {
-        this.endMatch(opponentId, playerId);
-      }
+      this.handleDisconnectDuringMatch(playerId);
     } else if (this.phase === "WAITING" || this.phase === "READY") {
-      // Clean up if a player disconnects before the match starts
       this.players.delete(playerId);
       this.playerOrder = this.playerOrder.filter((id) => id !== playerId);
       if (this.phase === "READY") {
@@ -210,10 +195,68 @@ export class MatchRoom extends DurableObject {
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     const tags = this.ctx.getTags(ws);
     const playerId = tags[0];
-    this.log("WEBSOCKET_ERROR", {
-      playerId,
-      error: String(error),
+    this.log("WEBSOCKET_ERROR", { playerId, error: String(error) });
+  }
+
+  // ==================== Reconnection Logic ====================
+
+  private handleDisconnectDuringMatch(disconnectedPlayerId: string): void {
+    const opponentId = this.getOpponentId(disconnectedPlayerId);
+    if (!opponentId) return;
+
+    this.log("WAITING_RECONNECT", { disconnectedPlayerId });
+    
+    // Pause match
+    this.pausedPhase = this.phase;
+    this.pausedTurnRemainingMs = this.turnDeadline ? Math.max(0, this.turnDeadline - Date.now()) : null;
+    this.phase = "WAITING_RECONNECT";
+    this.disconnectTimeoutId = disconnectedPlayerId;
+
+    // Set alarm for forfeit timeout
+    this.ctx.storage.setAlarm(Date.now() + GAME_CONFIG.RECONNECT_TIMEOUT_MS);
+
+    // Notify opponent
+    this.sendToPlayer(opponentId, {
+      type: "OPPONENT_DISCONNECTED",
+      reconnectTimeoutMs: GAME_CONFIG.RECONNECT_TIMEOUT_MS,
     });
+  }
+
+  private checkReconnection(): void {
+    if (this.phase !== "WAITING_RECONNECT") return;
+
+    // Are both players fully connected?
+    const p1Connected = this.ctx.getWebSockets(this.playerOrder[0]).length > 0;
+    const p2Connected = this.ctx.getWebSockets(this.playerOrder[1]).length > 0;
+
+    if (p1Connected && p2Connected) {
+      this.log("MATCH_RESUMED", {});
+      
+      // Resume match
+      this.phase = this.pausedPhase || "PLAYING";
+      this.disconnectTimeoutId = null;
+
+      // Restore timer
+      if (this.pausedTurnRemainingMs !== null) {
+        this.turnDeadline = Date.now() + this.pausedTurnRemainingMs;
+        this.ctx.storage.setAlarm(this.turnDeadline);
+      } else {
+        // If there was no timer, clear alarm
+        this.ctx.storage.deleteAlarm();
+      }
+
+      // Broadcast new state so timers sync up
+      for (const [id] of this.players) {
+        this.sendToPlayer(id, this.buildMatchState(id));
+      }
+      
+      // Also specifically notify opponent they reconnected
+      const reconnectedPlayerId = this.playerOrder.find(id => id !== this.disconnectTimeoutId) || this.playerOrder[0];
+      const opponentId = this.getOpponentId(reconnectedPlayerId);
+      if (opponentId) {
+        this.sendToPlayer(opponentId, { type: "OPPONENT_RECONNECTED" });
+      }
+    }
   }
 
   // ==================== Alarm (Timer) ====================
@@ -223,7 +266,18 @@ export class MatchRoom extends DurableObject {
       this.startMatch();
     } else if (this.phase === "PLAYING") {
       this.handleTurnTimeout();
+    } else if (this.phase === "WAITING_RECONNECT") {
+      this.handleReconnectTimeout();
     }
+  }
+
+  private handleReconnectTimeout(): void {
+    this.log("RECONNECT_TIMEOUT_EXPIRED", { disconnectedPlayerId: this.disconnectTimeoutId });
+    
+    const loserId = this.disconnectTimeoutId;
+    const winnerId = this.playerOrder.find(id => id !== loserId) || null;
+    
+    this.endMatch(winnerId, loserId);
   }
 
   // ==================== State Transitions ====================
@@ -232,29 +286,21 @@ export class MatchRoom extends DurableObject {
     this.phase = "READY";
     this.log("MATCH_READY", { matchId: this.matchId });
 
-    // Send MATCH_FOUND to each player with opponent info
     for (const [playerId] of this.players) {
       const opponentId = this.getOpponentId(playerId)!;
       const opponent = this.players.get(opponentId)!;
       this.sendToPlayer(playerId, {
         type: "MATCH_FOUND",
         matchId: this.matchId,
-        opponent: {
-          playerId: opponent.playerId,
-          displayName: opponent.displayName,
-        },
+        opponent: { playerId: opponent.playerId, displayName: opponent.displayName },
         countdownMs: GAME_CONFIG.READY_COUNTDOWN_MS,
       });
     }
 
-    // Set alarm for countdown to start
-    this.ctx.storage.setAlarm(
-      Date.now() + GAME_CONFIG.READY_COUNTDOWN_MS
-    );
+    this.ctx.storage.setAlarm(Date.now() + GAME_CONFIG.READY_COUNTDOWN_MS);
   }
 
   private startMatch(): void {
-    // Randomly decide who attacks first
     const firstAttackerIdx = flipCoin() === "HEADS" ? 0 : 1;
     this.attackerId = this.playerOrder[firstAttackerIdx];
     this.defenderId = this.playerOrder[1 - firstAttackerIdx];
@@ -264,11 +310,7 @@ export class MatchRoom extends DurableObject {
     this.phase = "PLAYING";
     this.consecutiveInactiveTurns = 0;
 
-    this.log("MATCH_STARTED", {
-      matchId: this.matchId,
-      firstAttacker: this.attackerId,
-    });
-
+    this.log("MATCH_STARTED", { matchId: this.matchId, firstAttacker: this.attackerId });
     this.startTurn();
   }
 
@@ -282,10 +324,8 @@ export class MatchRoom extends DurableObject {
       defender: this.defenderId,
     });
 
-    // Notify each player of their role
     for (const [playerId] of this.players) {
-      const role =
-        playerId === this.attackerId ? "attacker" : "defender";
+      const role = playerId === this.attackerId ? "attacker" : "defender";
       this.sendToPlayer(playerId, {
         type: "TURN_STARTED",
         turn: this.currentTurn,
@@ -294,105 +334,57 @@ export class MatchRoom extends DurableObject {
       });
     }
 
-    // Set alarm for turn deadline
     this.ctx.storage.setAlarm(this.turnDeadline);
   }
 
   // ==================== Action Handling ====================
 
   private handleAction(playerId: string, message: PlayerActionMessage): void {
-    // Validate phase
     if (this.phase !== "PLAYING") {
-      this.sendToPlayer(playerId, {
-        type: "ACTION_REJECTED",
-        turn: message.turn,
-        reason: "Match is not in PLAYING phase",
-      });
+      this.sendToPlayer(playerId, { type: "ACTION_REJECTED", turn: message.turn, reason: "Match is not in PLAYING phase" });
       return;
     }
 
-    // Validate turn number
     if (message.turn !== this.currentTurn) {
-      this.sendToPlayer(playerId, {
-        type: "ACTION_REJECTED",
-        turn: message.turn,
-        reason: `Wrong turn number. Expected ${this.currentTurn}`,
-      });
+      this.sendToPlayer(playerId, { type: "ACTION_REJECTED", turn: message.turn, reason: `Wrong turn number. Expected ${this.currentTurn}` });
       return;
     }
 
-    // Check if player already submitted action (one action per turn)
     if (this.actions.has(playerId)) {
-      this.sendToPlayer(playerId, {
-        type: "ACTION_REJECTED",
-        turn: message.turn,
-        reason: "Action already submitted for this turn",
-      });
+      this.sendToPlayer(playerId, { type: "ACTION_REJECTED", turn: message.turn, reason: "Action already submitted for this turn" });
       return;
     }
 
     const action = message.action;
 
-    // Validate direction
     if (!isValidDirection(action.direction)) {
-      this.sendToPlayer(playerId, {
-        type: "ACTION_REJECTED",
-        turn: message.turn,
-        reason: "Invalid direction",
-      });
+      this.sendToPlayer(playerId, { type: "ACTION_REJECTED", turn: message.turn, reason: "Invalid direction" });
       return;
     }
 
-    // Validate action matches player's role
     const isAttacker = playerId === this.attackerId;
 
     if (isAttacker && action.type !== "ATTACK") {
-      this.sendToPlayer(playerId, {
-        type: "ACTION_REJECTED",
-        turn: message.turn,
-        reason: "Attacker must use ATTACK action",
-      });
+      this.sendToPlayer(playerId, { type: "ACTION_REJECTED", turn: message.turn, reason: "Attacker must use ATTACK action" });
       return;
     }
 
-    if (
-      !isAttacker &&
-      action.type !== "DODGE" &&
-      action.type !== "COUNTER"
-    ) {
-      this.sendToPlayer(playerId, {
-        type: "ACTION_REJECTED",
-        turn: message.turn,
-        reason: "Defender must use DODGE or COUNTER action",
-      });
+    if (!isAttacker && action.type !== "DODGE" && action.type !== "COUNTER") {
+      this.sendToPlayer(playerId, { type: "ACTION_REJECTED", turn: message.turn, reason: "Defender must use DODGE or COUNTER action" });
       return;
     }
 
-    // Accept the action
     this.actions.set(playerId, action);
 
-    this.log("ACTION_RECEIVED", {
-      playerId,
-      turn: this.currentTurn,
-      actionType: action.type,
-    });
+    this.log("ACTION_RECEIVED", { playerId, turn: this.currentTurn, actionType: action.type });
 
-    // Confirm to the player
-    this.sendToPlayer(playerId, {
-      type: "ACTION_CONFIRMED",
-      turn: this.currentTurn,
-    });
+    this.sendToPlayer(playerId, { type: "ACTION_CONFIRMED", turn: this.currentTurn });
 
-    // Notify opponent (WITHOUT revealing the action)
     const opponentId = this.getOpponentId(playerId);
     if (opponentId) {
-      this.sendToPlayer(opponentId, {
-        type: "OPPONENT_READY",
-        turn: this.currentTurn,
-      });
+      this.sendToPlayer(opponentId, { type: "OPPONENT_READY", turn: this.currentTurn });
     }
 
-    // If both players have submitted, resolve immediately
     if (this.actions.size === 2) {
       this.resolveTurnNow();
     }
@@ -402,45 +394,32 @@ export class MatchRoom extends DurableObject {
 
   private handleTurnTimeout(): void {
     if (this.phase !== "PLAYING") return;
-    if (this.resolvedTurn >= this.currentTurn) return; // Guard against double resolution
+    if (this.resolvedTurn >= this.currentTurn) return;
 
     this.log("TURN_TIMEOUT", { turn: this.currentTurn });
     this.resolveTurnNow();
   }
 
   private resolveTurnNow(): void {
-    // Idempotency guard: prevent resolving the same turn twice
     if (this.resolvedTurn >= this.currentTurn) return;
     this.resolvedTurn = this.currentTurn;
 
     this.phase = "RESOLVING";
-
-    // Cancel any pending alarm (new alarm will be set if match continues)
     this.ctx.storage.deleteAlarm();
 
-    const attackerAction = this.actions.get(this.attackerId!) as
-      | AttackAction
-      | undefined;
-    const defenderAction = this.actions.get(this.defenderId!) as
-      | DefenderAction
-      | undefined;
+    const attackerAction = this.actions.get(this.attackerId!) as AttackAction | undefined;
+    const defenderAction = this.actions.get(this.defenderId!) as DefenderAction | undefined;
 
     const attackerActed = !!attackerAction;
     const defenderActed = !!defenderAction;
 
-    // Resolve using Game Engine
     let result: TurnResult;
 
     if (attackerActed && defenderActed) {
       result = resolveTurn(attackerAction!, defenderAction!);
       this.consecutiveInactiveTurns = 0;
     } else {
-      result = resolveTimeout(
-        attackerActed,
-        defenderActed,
-        attackerAction ?? null,
-        defenderAction ?? null
-      );
+      result = resolveTimeout(attackerActed, defenderActed, attackerAction ?? null, defenderAction ?? null);
       if (!attackerActed && !defenderActed) {
         this.consecutiveInactiveTurns++;
       } else {
@@ -448,21 +427,14 @@ export class MatchRoom extends DurableObject {
       }
     }
 
-    // Apply damage
     const attacker = this.players.get(this.attackerId!)!;
     const defender = this.players.get(this.defenderId!)!;
 
     attacker.hp = applyDamage(attacker.hp, result.attackerDamage);
     defender.hp = applyDamage(defender.hp, result.defenderDamage);
 
-    this.log("TURN_RESOLVED", {
-      turn: this.currentTurn,
-      outcome: result.outcome,
-      attackerHp: attacker.hp,
-      defenderHp: defender.hp,
-    });
+    this.log("TURN_RESOLVED", { turn: this.currentTurn, outcome: result.outcome, attackerHp: attacker.hp, defenderHp: defender.hp });
 
-    // Broadcast turn result (REVEAL)
     this.broadcast({
       type: "TURN_RESULT",
       turn: this.currentTurn,
@@ -477,7 +449,6 @@ export class MatchRoom extends DurableObject {
       defenderId: this.defenderId!,
     });
 
-    // Check victory
     const victory = checkVictory(attacker.hp, defender.hp);
 
     if (victory.gameOver) {
@@ -496,17 +467,12 @@ export class MatchRoom extends DurableObject {
       return;
     }
 
-    // Check inactivity abort
-    if (
-      this.consecutiveInactiveTurns >=
-      GAME_CONFIG.MAX_CONSECUTIVE_INACTIVE_TURNS
-    ) {
+    if (this.consecutiveInactiveTurns >= GAME_CONFIG.MAX_CONSECUTIVE_INACTIVE_TURNS) {
       this.log("MATCH_ABORTED", { reason: "INACTIVITY" });
       this.endMatch(null, null);
       return;
     }
 
-    // Next turn: swap roles
     const prevAttacker = this.attackerId;
     this.attackerId = this.defenderId;
     this.defenderId = prevAttacker;
@@ -516,10 +482,7 @@ export class MatchRoom extends DurableObject {
     this.startTurn();
   }
 
-  private endMatch(
-    winnerId: string | null,
-    loserId: string | null
-  ): void {
+  private endMatch(winnerId: string | null, loserId: string | null): void {
     this.winnerId = winnerId;
     this.phase = "FINISHED";
 
@@ -530,12 +493,7 @@ export class MatchRoom extends DurableObject {
       finalHp[id] = player.hp;
     }
 
-    this.log("MATCH_FINISHED", {
-      matchId: this.matchId,
-      winnerId,
-      loserId,
-      finalHp,
-    });
+    this.log("MATCH_FINISHED", { matchId: this.matchId, winnerId, loserId, finalHp });
 
     this.broadcast({
       type: "MATCH_FINISHED",
@@ -560,18 +518,14 @@ export class MatchRoom extends DurableObject {
     for (const ws of sockets) {
       try {
         ws.send(data);
-      } catch {
-        // Socket might be closed
-      }
+      } catch {}
     }
   }
 
   private sendToWs(ws: WebSocket, message: ServerMessage): void {
     try {
       ws.send(JSON.stringify(message));
-    } catch {
-      // Socket might be closed
-    }
+    } catch {}
   }
 
   private broadcast(message: ServerMessage): void {
@@ -580,32 +534,19 @@ export class MatchRoom extends DurableObject {
     for (const ws of sockets) {
       try {
         ws.send(data);
-      } catch {
-        // Socket might be closed
-      }
+      } catch {}
     }
   }
 
   private buildMatchState(forPlayerId: string): ServerMessage {
     const me = this.players.get(forPlayerId)!;
     const opponentId = this.getOpponentId(forPlayerId);
-    const opponent = opponentId
-      ? this.players.get(opponentId) ?? null
-      : null;
+    const opponent = opponentId ? this.players.get(opponentId) ?? null : null;
 
-    const myRole =
-      me.playerId === this.attackerId
-        ? "attacker"
-        : me.playerId === this.defenderId
-          ? "defender"
-          : "none";
-    const oppRole = opponent
-      ? opponent.playerId === this.attackerId
-        ? "attacker"
-        : opponent.playerId === this.defenderId
-          ? "defender"
-          : "none"
-      : "none";
+    const myRole = me.playerId === this.attackerId ? "attacker"
+        : me.playerId === this.defenderId ? "defender" : "none";
+    const oppRole = opponent ? (opponent.playerId === this.attackerId ? "attacker"
+        : opponent.playerId === this.defenderId ? "defender" : "none") : "none";
 
     return {
       type: "MATCH_STATE",
@@ -618,40 +559,31 @@ export class MatchRoom extends DurableObject {
         hp: me.hp,
         role: myRole as PlayerInfo["role"],
       },
-      opponent: opponent
-        ? {
-            playerId: opponent.playerId,
-            displayName: opponent.displayName,
-            hp: opponent.hp,
-            role: oppRole as PlayerInfo["role"],
-          }
-        : null,
+      opponent: opponent ? {
+        playerId: opponent.playerId,
+        displayName: opponent.displayName,
+        hp: opponent.hp,
+        role: oppRole as PlayerInfo["role"],
+      } : null,
       turnDeadline: this.turnDeadline,
       yourActionLocked: this.actions.has(forPlayerId),
     };
   }
 
   private sanitizeDisplayName(name: string): string {
-    // Strip any HTML/script tags, limit length
-    const clean = name
-      .replace(/[<>&"'/]/g, "")
-      .trim()
-      .slice(0, GAME_CONFIG.MAX_DISPLAY_NAME_LENGTH);
+    const clean = name.replace(/[<>&"'/]/g, "").trim().slice(0, GAME_CONFIG.MAX_DISPLAY_NAME_LENGTH);
     return clean || "Player";
   }
 
   private log(event: string, data?: Record<string, unknown>): void {
-    console.log(
-      JSON.stringify({
-        event,
-        matchId: this.matchId,
-        phase: this.phase,
-        timestamp: new Date().toISOString(),
-        ...data,
-      })
-    );
+    console.log(JSON.stringify({
+      event,
+      matchId: this.matchId,
+      phase: this.phase,
+      timestamp: new Date().toISOString(),
+      ...data,
+    }));
   }
 }
 
-// Re-export for type inference
 import type { PlayerActionMessage } from "../shared/protocol";

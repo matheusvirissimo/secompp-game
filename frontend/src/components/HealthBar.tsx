@@ -1,4 +1,4 @@
-import { GAME_CONFIG } from "../../../src/game/config";
+import { GAME_CONFIG } from "@game/config";
 
 interface HealthBarProps {
   hp: number;

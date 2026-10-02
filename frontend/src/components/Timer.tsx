@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { GAME_CONFIG } from "../../../src/game/config";
+import { GAME_CONFIG } from "@game/config";
 
 interface TimerProps {
   deadline: number | null;
