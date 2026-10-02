@@ -31,6 +31,7 @@ interface PlayerData {
 
 interface Env {
   MATCH_ROOM: DurableObjectNamespace;
+  ADMIN_REGISTRY: DurableObjectNamespace;
   DB: D1Database;
 }
 
@@ -51,6 +52,7 @@ export class MatchRoom extends DurableObject<Env> {
   private consecutiveInactiveTurns = 0;
   private resolvedTurn = 0; 
   private turnHistory: any[] = []; // Store turns for D1
+  private spectatorWebSockets = new Set<WebSocket>();
 
   // Reconnection state
   private pausedPhase: MatchPhase | null = null;
@@ -83,6 +85,18 @@ export class MatchRoom extends DurableObject<Env> {
   }
 
   private handleWebSocketUpgrade(url: URL): Response {
+    const isSpectator = url.searchParams.get("spectator") === "true";
+    
+    if (isSpectator) {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      this.ctx.acceptWebSocket(server);
+      this.spectatorWebSockets.add(server);
+      
+      this.sendToWs(server, this.buildMatchState(null));
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
     const playerId = url.searchParams.get("playerId");
     const displayName = url.searchParams.get("displayName");
     const sessionToken = url.searchParams.get("sessionToken");
@@ -171,6 +185,7 @@ export class MatchRoom extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket, code: number, _reason: string, _wasClean: boolean): Promise<void> {
+    this.spectatorWebSockets.delete(ws);
     const tags = this.ctx.getTags(ws);
     const playerId = tags[0];
     if (!playerId) return;
@@ -194,6 +209,7 @@ export class MatchRoom extends DurableObject<Env> {
   }
 
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
+    this.spectatorWebSockets.delete(ws);
     const tags = this.ctx.getTags(ws);
     const playerId = tags[0];
     this.log("WEBSOCKET_ERROR", { playerId, error: String(error) });
@@ -313,12 +329,41 @@ export class MatchRoom extends DurableObject<Env> {
     this.consecutiveInactiveTurns = 0;
 
     this.log("MATCH_STARTED", { matchId: this.matchId, firstAttacker: this.attackerId });
+    this.updateRegistry("register");
     this.startTurn();
+  }
+
+  private updateRegistry(action: "register" | "update" | "unregister") {
+    try {
+      const doId = this.env.ADMIN_REGISTRY.idFromName("global-registry");
+      const stub = this.env.ADMIN_REGISTRY.get(doId);
+      
+      const p1 = this.players.get(this.playerOrder[0]);
+      const p2 = this.players.get(this.playerOrder[1]);
+
+      stub.fetch(new Request(`http://internal/internal/${action}`, {
+        method: "POST",
+        body: JSON.stringify({
+          matchId: this.matchId,
+          p1Name: p1?.displayName || "Player 1",
+          p2Name: p2?.displayName || "Player 2",
+          p1Hp: p1?.hp ?? 0,
+          p2Hp: p2?.hp ?? 0,
+          turn: this.currentTurn
+        })
+      }));
+    } catch (e) {
+      // Ignore registry errors
+    }
   }
 
   private startTurn(): void {
     this.actions.clear();
     this.turnDeadline = Date.now() + GAME_CONFIG.TURN_DURATION_MS;
+    
+    if (this.currentTurn > 1) {
+      this.updateRegistry("update");
+    }
 
     this.log("TURN_STARTED", {
       turn: this.currentTurn,
@@ -514,6 +559,8 @@ export class MatchRoom extends DurableObject<Env> {
       finalHp,
     });
 
+    this.updateRegistry("unregister");
+
     this.ctx.waitUntil(this.persistMatch(winnerId, loserId, finalHp));
   }
 
@@ -665,13 +712,25 @@ export class MatchRoom extends DurableObject<Env> {
     }
   }
 
-  private buildMatchState(forPlayerId: string): ServerMessage {
-    const me = this.players.get(forPlayerId)!;
-    const opponentId = this.getOpponentId(forPlayerId);
-    const opponent = opponentId ? this.players.get(opponentId) ?? null : null;
+  private buildMatchState(forPlayerId: string | null): ServerMessage {
+    let me: PlayerData | null = null;
+    let opponentId: string | null = null;
+    let opponent: PlayerData | null = null;
 
-    const myRole = me.playerId === this.attackerId ? "attacker"
-        : me.playerId === this.defenderId ? "defender" : "none";
+    if (forPlayerId) {
+      me = this.players.get(forPlayerId) || null;
+      opponentId = this.getOpponentId(forPlayerId);
+      opponent = opponentId ? this.players.get(opponentId) ?? null : null;
+    } else {
+      // Spectator view: Treat p1 as "me" and p2 as "opponent"
+      const p1 = this.playerOrder[0];
+      const p2 = this.playerOrder[1];
+      if (p1) me = this.players.get(p1) || null;
+      if (p2) opponent = this.players.get(p2) || null;
+    }
+
+    const myRole = me?.playerId === this.attackerId ? "attacker"
+        : me?.playerId === this.defenderId ? "defender" : "none";
     const oppRole = opponent ? (opponent.playerId === this.attackerId ? "attacker"
         : opponent.playerId === this.defenderId ? "defender" : "none") : "none";
 
@@ -680,12 +739,12 @@ export class MatchRoom extends DurableObject<Env> {
       matchId: this.matchId,
       state: this.phase,
       turn: this.currentTurn,
-      you: {
+      you: me ? {
         playerId: me.playerId,
         displayName: me.displayName,
         hp: me.hp,
         role: myRole as PlayerInfo["role"],
-      },
+      } : { playerId: "", displayName: "", hp: 0, role: "none" },
       opponent: opponent ? {
         playerId: opponent.playerId,
         displayName: opponent.displayName,
@@ -693,7 +752,7 @@ export class MatchRoom extends DurableObject<Env> {
         role: oppRole as PlayerInfo["role"],
       } : null,
       turnDeadline: this.turnDeadline,
-      yourActionLocked: this.actions.has(forPlayerId),
+      yourActionLocked: forPlayerId ? this.actions.has(forPlayerId) : true,
     };
   }
 

@@ -5,13 +5,16 @@
 
 import { MatchRoom } from "../durable-objects/MatchRoom";
 import { MatchmakingQueue } from "../durable-objects/MatchmakingQueue";
+import { AdminRegistry } from "../durable-objects/AdminRegistry";
 
-export { MatchRoom, MatchmakingQueue };
+export { MatchRoom, MatchmakingQueue, AdminRegistry };
 
 interface Env {
   MATCH_ROOM: DurableObjectNamespace;
   MATCHMAKING_QUEUE: DurableObjectNamespace;
+  ADMIN_REGISTRY: DurableObjectNamespace;
   DB: D1Database;
+  ADMIN_PASSWORD?: string;
 }
 
 // ==================== CORS ====================
@@ -83,6 +86,46 @@ export default {
         const doId = env.MATCHMAKING_QUEUE.idFromName("global-queue");
         const stub = env.MATCHMAKING_QUEUE.get(doId);
         return stub.fetch(request);
+      }
+
+      // ---- WebSocket: Admin ----
+      if (url.pathname === "/ws/admin" || url.pathname === "/ws/featured") {
+        if (url.pathname === "/ws/admin") {
+          const token = url.searchParams.get("token");
+          if (token !== env.ADMIN_PASSWORD) {
+            return new Response("Unauthorized", { status: 401 });
+          }
+        }
+        const doId = env.ADMIN_REGISTRY.idFromName("global-registry");
+        const stub = env.ADMIN_REGISTRY.get(doId);
+        return stub.fetch(request);
+      }
+
+      // ---- HTTP: Admin Auth ----
+      if (url.pathname === "/api/admin/auth" && request.method === "POST") {
+        const body = await request.json() as { password?: string };
+        if (body.password === env.ADMIN_PASSWORD) {
+          return corsResponse(Response.json({ ok: true }));
+        }
+        return corsResponse(new Response("Unauthorized", { status: 401 }));
+      }
+
+      // ---- HTTP: Admin Feature Match ----
+      if (url.pathname === "/api/admin/feature" && request.method === "POST") {
+        const auth = request.headers.get("Authorization");
+        if (auth !== env.ADMIN_PASSWORD) {
+          return corsResponse(new Response("Unauthorized", { status: 401 }));
+        }
+        const doId = env.ADMIN_REGISTRY.idFromName("global-registry");
+        const stub = env.ADMIN_REGISTRY.get(doId);
+        
+        // Pass request to AdminRegistry DO to handle the actual setting
+        const doReq = new Request("http://internal/internal/feature", {
+          method: "POST",
+          body: JSON.stringify(await request.json())
+        });
+        await stub.fetch(doReq);
+        return corsResponse(Response.json({ ok: true }));
       }
 
       // ---- HTTP: create match ----
